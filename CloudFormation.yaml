@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  NotificationBucket:
+    Description: S3 bucket name that is the trigger to lambda. This bucket will be created, and should be where Raw Adobe Analytics data feeds are sent in Gzip format.
+    Type: String
+  DestinationBucket:
+    Description: S3 bucket where destination files will be landed in a HIVE folder structure.
+    Type: String
+
+
+Resources:
+  S3TriggerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+    Properties:
+      Environment:
+       Variables: 
+        NEW_BUCKET: !Ref DestinationBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          # defines strings to search for in filenames to identify lookup data and manifest data
+          lookup_data = "lookup_data"
+          manifest = ".txt"
+
+          # bucket to copy files to; set in env var
+          new_bucket = os.environ['NEW_BUCKET']
+
+          s3 = boto3.resource('s3')
+          s3_cli = boto3.client('s3')
+
+          def generate_new_filename(name):
+              split_name = name.split('/')
+              delim = "/"
+              name = split_name[-1]
+              prefix = delim.join(split_name[:-1])
+              prefix = prefix.strip('/')
+              if lookup_data in name:
+                  day = f"day={name[-21:-19]}"
+                  month = f"month={name[-24:-22]}"
+                  year = f"year={name[-29:-25]}"
+                  name = f"lookup_data/{prefix}{year}/{month}/{day}/{name}"
+                  return name
+              else:
+                  day = f"day={name[-9:-7]}"
+                  month = f"month={name[-12:-10]}"
+                  year = f"year={name[-17:-13]}"
+                  name = f"hit_data/{prefix}/{year}/{month}/{day}/{name}"
+                  return name
+
+          def copy_file(original_bucket,
+                        new_bucket,
+                        original_name,
+                        new_name):
+              copy_source = {
+                  'Bucket': original_bucket,
+                  'Key': original_name
+              }
+              s3.meta.client.copy(copy_source, new_bucket, new_name)
+
+          def check_etags(original_bucket,
+                        new_bucket,
+                        original_name,
+                        new_name):
+              original_s3_resp = s3_cli.head_object(Bucket=original_bucket, Key=original_name)
+              new_s3_resp = s3_cli.head_object(Bucket=new_bucket, Key=new_name)
+              if original_s3_resp['ETag'] == new_s3_resp['ETag']:
+                  print('Ok! ETags match')
+              else:
+                  print('WARNING: ETags do not match')
+
+          def lambda_handler(event,context):
+              for record in event['Records']:
+                  try: 
+                      original_name = record['s3']['object']['key']
+                      original_bucket = record['s3']['bucket']['name']
+                      if manifest in original_name:
+                          print('Manifest file, skipping')
+                          break
+                      else:
+                          new_name = generate_new_filename(original_name)
+                          copy_file(original_bucket=original_bucket,
+                                    original_name=original_name,
+                                    new_bucket=new_bucket,
+                                    new_name=new_name)
+                          check_etags(original_bucket=original_bucket,
+                                      original_name=original_name,
+                                      new_bucket=new_bucket,
+                                      new_name=new_name)
+                  except KeyError:
+                      print('Not an S3 Event')
+                      break
+
+
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaIAMRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt S3TriggerLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:s3:::${NotificationBucket}
+
+  LambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LogAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: ReadSourceBucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${NotificationBucket}/*
+        - PolicyName: WriteDestinationBucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${DestinationBucket}/*
+
+  S3BucketNotification:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - LambdaInvokePermission
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_REPLICATION_ENABLED
+          - S3_BUCKET_VERSIONING_ENABLED
+          - S3_BUCKET_LOGGING_ENABLED
+    Properties:
+      BucketName: !Sub ${NotificationBucket}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt S3TriggerLambdaFunction.Arn
+          - Event: s3:ObjectCreated:Post
+            Function: !GetAtt S3TriggerLambdaFunction.Arn
+          - Event: s3:ObjectCreated:Copy
+            Function: !GetAtt S3TriggerLambdaFunction.Arn
